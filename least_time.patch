@@ -1,0 +1,130 @@
+diff --git a/src/event/ngx_event_connect.h b/src/event/ngx_event_connect.h
+index 72d21d7..bd87421 100644
+--- a/src/event/ngx_event_connect.h
++++ b/src/event/ngx_event_connect.h
+@@ -47,6 +47,14 @@ struct ngx_peer_connection_s {
+     ngx_event_free_peer_pt           free;
+     ngx_event_notify_peer_pt         notify;
+     void                            *data;
++    void                            *peer;
++    ngx_msec_t                       response_time;
++    ngx_msec_t                       header_time;
++
++    ngx_msec_t                      *average_response_time;
++    ngx_msec_t                      *current_response_time;
++    ngx_msec_t                      *average_header_time;
++    ngx_msec_t                      *current_header_time;
+ 
+ #if (NGX_SSL || NGX_COMPAT)
+     ngx_event_set_peer_session_pt    set_session;
+diff --git a/src/http/ngx_http_upstream.c b/src/http/ngx_http_upstream.c
+index aba1fbb..c487402 100644
+--- a/src/http/ngx_http_upstream.c
++++ b/src/http/ngx_http_upstream.c
+@@ -4265,6 +4265,7 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
+     ngx_http_upstream_t *u, ngx_int_t rc)
+ {
+     ngx_uint_t  flush;
++    ngx_msec_t  average_response_time=1, average_header_time=1;
+ 
+     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "finalize http upstream request: %i", rc);
+@@ -4285,6 +4286,13 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
+ 
+     if (u->state && u->state->response_time) {
+         u->state->response_time = ngx_current_msec - u->state->response_time;
++        u->peer.response_time = u->state->response_time;
++        if (u->peer.response_time == 0) {
++            u->peer.response_time += 1;
++        }
++        if (u->peer.header_time == 0 && u->state->bytes_received == 0) {
++            u->peer.header_time = u->peer.response_time;
++        }
+ 
+         if (u->pipe && u->pipe->read_length) {
+             u->state->bytes_received += u->pipe->read_length
+@@ -4296,6 +4304,27 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
+     u->finalize_request(r, rc);
+ 
+     if (u->peer.free && u->peer.sockaddr) {
++        if (u->peer.connection) {
++            if (*u->peer.current_response_time > 0) {
++                average_response_time = (u->peer.response_time * 3 +
++                        *u->peer.average_response_time) / 4;
++            } else {
++                average_response_time = u->peer.response_time;
++            }
++
++            if (*u->peer.current_header_time > 0) {
++                average_header_time = (u->peer.header_time * 3 +
++                        *u->peer.average_header_time) / 4;
++            } else {
++                average_header_time = u->peer.header_time;
++            }
++
++            *u->peer.current_response_time = u->peer.response_time;
++            *u->peer.current_header_time = u->peer.header_time;
++            *u->peer.average_header_time = average_header_time;
++            *u->peer.average_response_time = average_response_time;
++        }
++
+         u->peer.free(&u->peer, u->peer.data, 0);
+         u->peer.sockaddr = NULL;
+     }
+diff --git a/src/http/ngx_http_upstream_round_robin.c b/src/http/ngx_http_upstream_round_robin.c
+index f6051ae..37875c5 100644
+--- a/src/http/ngx_http_upstream_round_robin.c
++++ b/src/http/ngx_http_upstream_round_robin.c
+@@ -97,6 +97,14 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
+                 peer[n].fail_timeout = server[i].fail_timeout;
+                 peer[n].down = server[i].down;
+                 peer[n].server = server[i].name;
++                peer[n].current_response_time = ngx_pcalloc(cf->pool, sizeof(ngx_msec_t));
++                *peer[n].current_response_time = 0;
++                peer[n].current_header_time = ngx_pcalloc(cf->pool, sizeof(ngx_msec_t));
++                *peer[n].current_header_time = 0;
++                peer[n].average_response_time = ngx_pcalloc(cf->pool, sizeof(ngx_msec_t));
++                *peer[n].average_response_time = 0;
++                peer[n].average_header_time = ngx_pcalloc(cf->pool, sizeof(ngx_msec_t));
++                *peer[n].average_header_time = 0;
+ 
+                 *peerp = &peer[n];
+                 peerp = &peer[n].next;
+@@ -466,6 +474,11 @@ ngx_http_upstream_get_round_robin_peer(ngx_peer_connection_t *pc, void *data)
+ 
+     peer->conns++;
+ 
++    pc->average_header_time = peer->average_header_time;
++    pc->average_response_time = peer->average_response_time;
++    pc->current_header_time = peer->current_header_time;
++    pc->current_response_time = peer->current_response_time;
++
+     ngx_http_upstream_rr_peers_unlock(peers);
+ 
+     return NGX_OK;
+diff --git a/src/http/ngx_http_upstream_round_robin.h b/src/http/ngx_http_upstream_round_robin.h
+index 45f258d..2d8ec52 100644
+--- a/src/http/ngx_http_upstream_round_robin.h
++++ b/src/http/ngx_http_upstream_round_robin.h
+@@ -49,6 +49,13 @@ struct ngx_http_upstream_rr_peer_s {
+     ngx_atomic_t                    lock;
+ #endif
+ 
++    ngx_msec_t                     *least_time;
++
++    ngx_msec_t                     *current_response_time;
++    ngx_msec_t                     *current_header_time;
++    ngx_msec_t                     *average_response_time;
++    ngx_msec_t                     *average_header_time;
++
+     ngx_http_upstream_rr_peer_t    *next;
+ 
+     NGX_COMPAT_BEGIN(32)
+@@ -60,6 +67,7 @@ typedef struct ngx_http_upstream_rr_peers_s  ngx_http_upstream_rr_peers_t;
+ 
+ struct ngx_http_upstream_rr_peers_s {
+     ngx_uint_t                      number;
++    ngx_flag_t                      first_request;
+ 
+ #if (NGX_HTTP_UPSTREAM_ZONE)
+     ngx_slab_pool_t                *shpool;
